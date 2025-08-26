@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  pdfa:
+    build:
+      context: .
+      dockerfile: dockerfile   # <- dein vorhandenes Dockerfile im Projektordner
+    container_name: pdfa-service
+    ports:
+      - "3296:8080"
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./work:/work           # optionaler Arbeitsordner (wird von app.py bereinigt)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+# Optional: n8n im selben Compose-Stack starten und direkt mit pdfa sprechen
+#  n8n:
+#    image: n8nio/n8n:latest
+#    container_name: n8n
+#    ports:
+#      - "5678:5678"
+#    environment:
+#      - N8N_DIAGNOSTICS_ENABLED=false
+#      - EXECUTIONS_DATA_SAVE_ON_ERROR=none
+#      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=none
+#      - EXECUTIONS_DATA_PRUNE=true
+#      - N8N_BINARY_DATA_MODE=filesystem
+#      - N8N_ENCRYPTION_KEY=change-me
+#    volumes:
+#      - ./n8n:/home/node/.n8n
+#      - ./work:/data
+#    depends_on:
+#      pdfa:
+#        condition: service_healthy
+#    restart: unless-stopped
