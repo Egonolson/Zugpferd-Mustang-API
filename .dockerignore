@@ -1,0 +1,10 @@
+.git
+.taskmaster
+work
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+
+

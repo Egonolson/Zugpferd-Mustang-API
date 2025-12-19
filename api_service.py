@@ -3,6 +3,8 @@ import subprocess
 import tempfile
 import os
 import logging
+import xml.etree.ElementTree as ET
+from typing import Optional
 
 app = Flask(__name__)
 
@@ -15,7 +17,61 @@ app.logger.addHandler(handler)
 app.logger.propagate = False
 
 ICC_PROFILE_PATH = '/opt/mustang/sRGB.icc' # Wird für diesen Endpunkt nicht direkt verwendet, aber global definiert
-MUSTANG_CLI_JAR = '/opt/mustang/Mustang-CLI-2.16.4.jar' # Ihre Version
+# Stable symlink created in Dockerfile (points to the actual versioned jar)
+MUSTANG_CLI_JAR = '/opt/mustang/Mustang-CLI.jar'
+
+# ───── Healthcheck ─────
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"ok": True, "status": "healthy"}), 200
+
+def _tail(text: str, max_len: int = 8000) -> str:
+    if not text:
+        return ""
+    return text[-max_len:] if len(text) > max_len else text
+
+def _extract_validation_xml(text: str) -> Optional[str]:
+    """
+    Mustang CLI prints an XML report to stdout, but may also emit log lines before/after.
+    We extract the first XML declaration and the last closing </validation> tag.
+    """
+    if not text:
+        return None
+    start = text.find("<?xml")
+    if start < 0:
+        return None
+    end = text.rfind("</validation>")
+    if end < 0 or end <= start:
+        return None
+    end += len("</validation>")
+    return text[start:end]
+
+def _parse_mustang_validation_report(xml_report: str) -> dict:
+    root = ET.fromstring(xml_report)
+
+    # Prefer the summary inside <xml>, fall back to the top-level summary
+    summary_el = root.find("./xml/summary") or root.find("./summary") or root.find(".//summary")
+    status = summary_el.get("status") if summary_el is not None else None
+
+    findings = []
+    # Findings can appear under <xml><messages> and/or top-level <messages>
+    for path in ("./xml/messages", "./messages"):
+        msgs = root.find(path)
+        if msgs is None:
+            continue
+        for item in list(msgs):
+            findings.append({
+                "tag": item.tag,
+                "attributes": dict(item.attrib),
+                "text": (item.text or "").strip()
+            })
+
+    return {
+        "filename": root.get("filename"),
+        "datetime": root.get("datetime"),
+        "status": status,
+        "findings": findings
+    }
 
 # ───── MustangCLI-Endpunkt (Diagrammerstellung - wie zuvor) ─────
 @app.route('/generate', methods=['POST'])
@@ -173,7 +229,9 @@ def embed_xml():
             '--format', zugferd_format_param,# z.B. 'zf' oder 'fx'
             '--version', zugferd_version_param, # z.B. '2'
             '--profile', zugferd_profile_param,  # z.B. 'XRechnung'
-            '--attachments', '""' 
+            # Avoid interactive prompts: pass a single empty attachment filename and disable prompting.
+            '--attachments', '',
+            '--no-additional-attachments'
         ]
 
         app.logger.info(f"MustangCLI /embed_xml: Führe Befehl aus: {' '.join(mustang_cmd)}")
@@ -198,5 +256,117 @@ def embed_xml():
         download_filename = f"zugferd_fmt-{zugferd_format_param}_v{zugferd_version_param}_{zugferd_profile_param}.pdf"
         return send_file(temp_output_pdf_path, mimetype='application/pdf', as_attachment=True, download_name=download_filename)
 
+@app.route('/validate', methods=['POST'])
+def validate():
+    """
+    Erwartet:
+      - multipart/form-data mit Feldname 'file' (empfohlen), ODER
+      - application/pdf   (Rohdaten im Body), ODER
+      - application/xml   (Rohdaten im Body)
+
+    Ruft Mustang-CLI 'validate <datei>' auf und liefert stdout/stderr/returncode zurück.
+    """
+    ctype = request.content_type or ''
+    uploaded_bytes = None
+    filename = 'invoice'
+
+    if ctype.startswith('multipart/form-data'):
+        if 'file' not in request.files:
+            app.logger.error("MustangCLI /validate: Kein File-Feld 'file'.")
+            abort(400, "Kein File-Feld 'file' gefunden")
+        f = request.files['file']
+        uploaded_bytes = f.read()
+        filename = f.filename or filename
+    elif ctype in ('application/pdf', 'application/xml', 'text/xml'):
+        uploaded_bytes = request.get_data()
+        # Dateiendung für temp-Datei ableiten
+        if ctype == 'application/pdf':
+            filename += '.pdf'
+        else:
+            filename += '.xml'
+    else:
+        app.logger.error(f"MustangCLI /validate: Unsupported Content-Type: {ctype}")
+        abort(400, f"Content-Type muss multipart/form-data, application/pdf oder application/xml sein (war: '{ctype}').")
+
+    if not uploaded_bytes:
+        abort(400, "Upload ist leer.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # sinnvolle Endung, falls nicht vorhanden
+        if not (filename.endswith('.pdf') or filename.endswith('.xml')):
+            # einfacher Heuristik-Fallback
+            filename += '.pdf' if uploaded_bytes[:5] == b'%PDF-' else '.xml'
+
+        input_path = os.path.join(tmp, filename)
+        with open(input_path, 'wb') as f:   
+            f.write(uploaded_bytes)
+
+        cmd = [
+            "java", "-jar", MUSTANG_CLI_JAR,
+            "--action", "validate",
+            "--source", input_path,
+            "--no-notices"
+        ]
+        app.logger.info(f"MustangCLI /validate: Führe Befehl aus: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired as e:
+            msg = f"MustangCLI /validate Timeout: {e}"
+            app.logger.error(msg)
+            return jsonify({"ok": False, "error": "timeout", "message": msg}), 504
+        except FileNotFoundError:
+            # Java nicht im PATH
+            msg = "Java nicht gefunden. Ist openjdk-17-jre-headless installiert und 'java' im PATH?"
+            app.logger.error(f"MustangCLI /validate: {msg}")
+            return jsonify({"ok": False, "error": "java_not_found", "message": msg}), 500
+
+        stdout = (result.stdout or "")
+        stderr = (result.stderr or "")
+
+        xml_report = _extract_validation_xml(stdout)
+        if not xml_report:
+            # Fallback: sometimes the report might be on stderr (rare)
+            xml_report = _extract_validation_xml(stderr)
+
+        if not xml_report:
+            msg = "Konnte keinen Mustang-XML-Validierungsreport aus stdout/stderr extrahieren."
+            app.logger.error(f"MustangCLI /validate: {msg}")
+            return jsonify({
+                "ok": False,
+                "error": "no_xml_report",
+                "message": msg,
+                "returncode": result.returncode,
+                "stdout_tail": _tail(stdout),
+                "stderr_tail": _tail(stderr)
+            }), 500
+
+        try:
+            report = _parse_mustang_validation_report(xml_report)
+        except ET.ParseError as e:
+            msg = f"XML-Report konnte nicht geparst werden: {e}"
+            app.logger.error(f"MustangCLI /validate: {msg}")
+            return jsonify({
+                "ok": False,
+                "error": "xml_parse_error",
+                "message": msg,
+                "returncode": result.returncode,
+                "stdout_tail": _tail(stdout),
+                "stderr_tail": _tail(stderr)
+            }), 500
+
+        status = (report.get("status") or "").lower()
+        is_valid = (status == "valid")
+
+        return jsonify({
+            "ok": is_valid,
+            "status": report.get("status"),
+            "returncode": result.returncode,
+            "report": {
+                "filename": report.get("filename"),
+                "datetime": report.get("datetime")
+            },
+            "findings": report.get("findings", [])
+        }), (200 if is_valid else 422)
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=True)

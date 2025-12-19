@@ -1,0 +1,11 @@
+.DS_Store
+work/
+.taskmaster/
+Mustang-CLI-*.jar
+ghostscript-*.tar.gz
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+
+
