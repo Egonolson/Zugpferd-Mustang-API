@@ -16,7 +16,7 @@ WORKDIR /usr/src
 
 # Download Ghostscript sources from official GitHub release assets
 RUN set -eux; \
-    GS_TAG="$(echo "${GS_VERSION}" | awk -F. '{printf \"gs%d%02d%d\", $1,$2,$3}')"; \
+    GS_TAG="gs$(printf '%s' "${GS_VERSION}" | tr -d '.')"; \
     curl -fsSL -o ghostscript_archive.tar.gz \
       "https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/${GS_TAG}/ghostscript-${GS_VERSION}.tar.gz"; \
     tar -xzf ghostscript_archive.tar.gz; \
