@@ -9,6 +9,19 @@ from typing import Optional
 
 app = Flask(__name__)
 
+# ───── ZUGFeRD Profile Normalisierung ─────
+PROFILE_MAPPING = {
+    'EN16931': 'COMFORT',
+    'en16931': 'COMFORT',
+    'En16931': 'COMFORT',
+    'MINIMUM': 'MINIMUM',
+    'BASICWL': 'BASICWL',
+    'BASIC': 'BASIC',
+    'COMFORT': 'COMFORT',
+    'EXTENDED': 'EXTENDED',
+    'XRECHNUNG': 'XRECHNUNG',
+}
+
 # Konfiguriere den Flask Logger (wie zuvor)
 app.logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -275,7 +288,9 @@ def embed_xml():
     # Sicherstellen, dass der Profilname exakt einem der gültigen Werte entspricht
     # z.B. "XRechnung", "EN16931", "COMFORT" etc. (Groß-/Kleinschreibung beachten!)
     # Als Default nehmen wir einen gängigen Wert für Deutschland.
-    zugferd_profile_param = request.args.get('profile', 'XRechnung') 
+    zugferd_profile_param = request.args.get('profile', 'XRECHNUNG')
+    # NEU: Mapping anwenden
+    zugferd_profile_param = PROFILE_MAPPING.get(zugferd_profile_param, zugferd_profile_param)
     
     # Format-Parameter, 'zf' für ZUGFeRD oder 'fx' für Factur-X.
     zugferd_format_param = request.args.get('format', 'zf')
