@@ -4,6 +4,7 @@ import tempfile
 import os
 import logging
 import xml.etree.ElementTree as ET
+import hmac
 from typing import Optional
 
 app = Flask(__name__)
@@ -19,11 +20,91 @@ app.logger.propagate = False
 ICC_PROFILE_PATH = '/opt/mustang/sRGB.icc' # Wird für diesen Endpunkt nicht direkt verwendet, aber global definiert
 # Stable symlink created in Dockerfile (points to the actual versioned jar)
 MUSTANG_CLI_JAR = '/opt/mustang/Mustang-CLI.jar'
+MUSTANG_TAG_PATH = '/opt/mustang/mustang_tag.txt'
+MUSTANG_HELP_PATH = '/opt/mustang/mustang_help.txt'
+
+def _safe_read_text(path: str, max_bytes: int = 32_000) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(max_bytes).strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        app.logger.warning(f"Could not read {path}: {e}")
+        return None
+
+def _run_version_cmd(cmd: list[str], timeout: int = 3) -> Optional[str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+        # Some tools (java -version) print to stderr
+        merged = "\n".join([x for x in [out, err] if x])
+        return merged if merged else None
+    except Exception as e:
+        app.logger.warning(f"Version cmd failed ({cmd}): {e}")
+        return None
+
+def _try_parse_json(text: str) -> Optional[dict]:
+    try:
+        import json
+        return json.loads(text)
+    except Exception:
+        return None
+
+# ───── Auth (Bearer Token) ─────
+API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN")
+if not API_BEARER_TOKEN:
+    # Hard fail: Service is intended to be publicly reachable.
+    raise RuntimeError("API_BEARER_TOKEN is not set. Refusing to start.")
+
+def _is_authorized(auth_header: Optional[str]) -> bool:
+    if not auth_header:
+        return False
+    if not auth_header.startswith("Bearer "):
+        return False
+    provided = auth_header[len("Bearer "):].strip()
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, API_BEARER_TOKEN)
+
+@app.before_request
+def require_bearer_token():
+    auth = request.headers.get("Authorization")
+    if not _is_authorized(auth):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
 # ───── Healthcheck ─────
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"ok": True, "status": "healthy"}), 200
+
+@app.route('/version', methods=['GET'])
+def version():
+    """
+    Returns runtime version information for debugging/compliance:
+    - Mustang tag used during build
+    - Java runtime version
+    - Ghostscript version
+    - veraPDF CLI version (if installed)
+    """
+    return jsonify({
+        "ok": True,
+        "mustang": {
+            "tag": _safe_read_text(MUSTANG_TAG_PATH),
+            "helpUsageLine": (_safe_read_text(MUSTANG_HELP_PATH) or "").splitlines()[0:1]
+        },
+        "java": {
+            "version": _run_version_cmd(["java", "-version"])
+        },
+        "ghostscript": {
+            "version": _run_version_cmd(["gs", "--version"])
+        },
+        "verapdf": {
+            "version": _run_version_cmd(["verapdf", "--version"]),
+            "helpUsageLine": (_run_version_cmd(["verapdf", "--help"], timeout=2) or "").splitlines()[0:1]
+        }
+    }), 200
 
 def _tail(text: str, max_len: int = 8000) -> str:
     if not text:
@@ -368,5 +449,105 @@ def validate():
             },
             "findings": report.get("findings", [])
         }), (200 if is_valid else 422)
+
+@app.route('/validate_pdfa', methods=['POST'])
+def validate_pdfa():
+    """
+    PDF/A validation using veraPDF CLI.
+
+    Accepts:
+      - multipart/form-data with field 'file'
+      - application/pdf raw body
+
+    Returns:
+      - 200 if PDF/A conform
+      - 422 if not conform
+      - full veraPDF report parsed as JSON (format=json)
+    """
+    ctype = request.content_type or ''
+    pdf_data = None
+
+    if ctype.startswith('multipart/form-data'):
+        if 'file' not in request.files:
+            abort(400, "Kein File-Feld 'file' gefunden")
+        pdf_data = request.files['file'].read()
+    elif ctype == 'application/pdf':
+        pdf_data = request.get_data()
+    else:
+        abort(400, f"Content-Type muss application/pdf oder multipart/form-data sein (war: '{ctype}')")
+
+    if not pdf_data:
+        abort(400, "Upload ist leer.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path = os.path.join(tmp, 'input.pdf')
+        with open(input_path, 'wb') as f:
+            f.write(pdf_data)
+
+        # veraPDF JSON report to stdout
+        cmd = [
+            "verapdf",
+            "--format", "json",
+            input_path
+        ]
+        app.logger.info(f"veraPDF /validate_pdfa: Führe Befehl aus: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired as e:
+            msg = f"veraPDF Timeout: {e}"
+            app.logger.error(msg)
+            return jsonify({"ok": False, "error": "timeout", "message": msg}), 504
+        except FileNotFoundError:
+            msg = "veraPDF CLI nicht gefunden. Ist 'verapdf' im Container installiert?"
+            app.logger.error(msg)
+            return jsonify({"ok": False, "error": "verapdf_not_found", "message": msg}), 500
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+
+        report_json = _try_parse_json(stdout)
+        if report_json is None:
+            # Some versions might write to stderr; try that as fallback
+            report_json = _try_parse_json(stderr)
+
+        if report_json is None:
+            msg = "veraPDF Report konnte nicht als JSON geparst werden."
+            app.logger.error(f"veraPDF /validate_pdfa: {msg}")
+            return jsonify({
+                "ok": False,
+                "error": "report_parse_error",
+                "message": msg,
+                "returncode": result.returncode,
+                "stdout_tail": _tail(stdout),
+                "stderr_tail": _tail(stderr)
+            }), 500
+
+        # Determine overall validity: be defensive with schema differences
+        ok = False
+        try:
+            report = report_json.get("report", report_json)
+            jobs = report.get("jobs") or []
+            if jobs and isinstance(jobs, list):
+                vr = jobs[0].get("validationResult")
+                if isinstance(vr, dict) and "isCompliant" in vr:
+                    ok = bool(vr.get("isCompliant"))
+                else:
+                    # If validationResult is absent, fall back to batch summary counts
+                    vs = (report.get("batchSummary") or {}).get("validationSummary") or {}
+                    total = vs.get("totalJobCount")
+                    compliant = vs.get("compliantPdfaCount")
+                    failed = vs.get("failedJobCount")
+                    parse_failed = (report.get("batchSummary") or {}).get("failedParsingJobs")
+                    if total == 1:
+                        ok = (compliant == 1) and (failed in (0, None)) and (parse_failed in (0, None))
+        except Exception:
+            ok = False
+
+        return jsonify({
+            "ok": ok,
+            "returncode": result.returncode,
+            "verapdf": report_json
+        }), (200 if ok else 422)
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=True)

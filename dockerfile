@@ -65,6 +65,11 @@ RUN set -eux; \
     grep -q "metrics|combine" /out/mustang_help.txt; \
     grep -q "|validate" /out/mustang_help.txt
 
+# ---- Stage 3: veraPDF CLI (prebuilt) ----
+# Use upstream veraPDF CLI image and copy its installation into our runtime image.
+# Note: verapdf/cli currently ships as linux/amd64; we only copy scripts/jars (arch-independent).
+FROM --platform=linux/amd64 verapdf/cli:latest AS verapdf_cli
+
 # ---- Stage 3: Final image ----
 # Keep Debian bullseye runtime to match Ghostscript's runtime library expectations.
 FROM debian:bullseye-slim
@@ -100,6 +105,10 @@ RUN ln -sf "$JAVA_HOME/bin/java" /usr/bin/java
 COPY --from=mustang_builder /out/Mustang-CLI.jar /opt/mustang/Mustang-CLI.jar
 COPY --from=mustang_builder /out/mustang_tag.txt /opt/mustang/mustang_tag.txt
 COPY --from=mustang_builder /out/mustang_help.txt /opt/mustang/mustang_help.txt
+
+# veraPDF CLI (copied from upstream image)
+COPY --from=verapdf_cli /opt/verapdf /opt/verapdf
+RUN ln -sf /opt/verapdf/verapdf /usr/local/bin/verapdf
 
 COPY sRGB.icc /opt/mustang/sRGB.icc
 COPY api_service.py /opt/mustang/api_service.py

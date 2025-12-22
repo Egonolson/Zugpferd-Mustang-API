@@ -45,6 +45,13 @@ docker compose up -d --force-recreate
 
 Service läuft standardmäßig auf `http://localhost:3296`.
 
+## Auth (Bearer Token)
+
+Alle Endpunkte sind per Bearer Token abgesichert (inkl. `/health`).
+
+- Setze im Container/Stack die ENV **`API_BEARER_TOKEN`**
+- Sende bei jedem Request den Header: `Authorization: Bearer <API_BEARER_TOKEN>`
+
 ## Endpunkte
 
 ### Health
@@ -54,7 +61,13 @@ Service läuft standardmäßig auf `http://localhost:3296`.
 Beispiel:
 
 ```bash
-curl -fsS http://localhost:3296/health
+curl -fsS -H "Authorization: Bearer $API_BEARER_TOKEN" http://localhost:3296/health
+```
+
+### Version
+
+```bash
+curl -fsS -H "Authorization: Bearer $API_BEARER_TOKEN" http://localhost:3296/version
 ```
 
 ### Validierung (PDF oder XML)
@@ -67,7 +80,7 @@ Die API ruft intern Mustang-CLI `--action validate --source ...` auf und **parst
 Beispiel (XML via stdin):
 
 ```bash
-curl -sS -X POST -F 'file=@-;filename=invoice.xml;type=application/xml' http://localhost:3296/validate << 'EOF'
+curl -sS -H "Authorization: Bearer $API_BEARER_TOKEN" -X POST -F 'file=@-;filename=invoice.xml;type=application/xml' http://localhost:3296/validate << 'EOF'
 <rsm:CrossIndustryInvoice xmlns:rsm="urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100" />
 EOF
 ```
@@ -77,6 +90,20 @@ Antwort (Beispiel):
 - `ok`: `true|false`
 - `status`: `valid|invalid` (aus dem Mustang-Report)
 - `findings`: Liste der Findings aus dem Report (z.B. `<exception>`, `<error>`, …)
+
+### PDF/A Validierung (veraPDF)
+
+- **POST** `/validate_pdfa`
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer $API_BEARER_TOKEN" \
+  -X POST \
+  -F "file=@in.pdf;type=application/pdf" \
+  http://localhost:3296/validate_pdfa
+```
+
+Hinweis: veraPDF wird aus dem Docker-Image `verapdf/cli` übernommen. Dieses ist derzeit `linux/amd64`; wir kopieren nur Scripts/JARs (arch-unabhängig). Auf ARM Hosts kann der Build daher QEMU/Emulation benötigen.
 
 ### XML in PDF einbetten (ZUGFeRD/Factur-X)
 
@@ -100,5 +127,11 @@ Hinweis: `--no-additional-attachments` ist aktiv, damit die CLI niemals interakt
 
 - Die Mustang-CLI liefert Validierungsergebnisse, Profile und Regeln je nach Version. Für Details zur CLI siehe die Mustang-Dokumentation: `https://www.mustangproject.org/commandline/`.
 - Für PDF/A-Konformität kann eine zusätzliche Prüfung mit externen Tools (z.B. veraPDF) sinnvoll sein, je nach Compliance-Anforderung.
+
+## n8n Hinweis
+
+Im n8n `HTTP Request` Node:
+- **Header**: `Authorization` = `Bearer <dein_token>`
+- Für `/convert_pdfa3` bei `multipart/form-data` muss das Feld **`file`** heißen (Input Data Field Name = `file`).
 
 
