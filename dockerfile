@@ -2,7 +2,7 @@
 FROM debian:bullseye AS gs_builder
 
 # Ghostscript version to build
-ARG GS_VERSION=10.05.1
+ARG GS_VERSION=10.06.0
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -95,7 +95,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps
-RUN pip3 install --no-cache-dir flask==3.0.3 werkzeug==3.0.3
+RUN pip3 install --no-cache-dir flask==3.1.2 werkzeug==3.1.3
 
 # Java 21 runtime from builder (Temurin)
 COPY --from=mustang_builder /opt/java/openjdk /opt/java/openjdk

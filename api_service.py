@@ -413,7 +413,7 @@ def validate():
             return jsonify({"ok": False, "error": "timeout", "message": msg}), 504
         except FileNotFoundError:
             # Java nicht im PATH
-            msg = "Java nicht gefunden. Ist openjdk-17-jre-headless installiert und 'java' im PATH?"
+            msg = "Java nicht gefunden. Ist Java 21 (Temurin) installiert und 'java' im PATH?"
             app.logger.error(f"MustangCLI /validate: {msg}")
             return jsonify({"ok": False, "error": "java_not_found", "message": msg}), 500
 
